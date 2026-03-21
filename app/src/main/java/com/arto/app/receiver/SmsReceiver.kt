@@ -10,11 +10,13 @@ import android.provider.ContactsContract
 import android.provider.Telephony
 import android.util.Log
 import androidx.core.content.ContextCompat
-import com.arto.app.domain.sanitizer.PiiSanitizer
+import com.arto.app.domain.usecase.AnalyzeMessageUseCase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import org.koin.core.component.KoinComponent
+import org.koin.core.component.inject
 
 /**
  * SmsReceiver — Intercepts incoming SMS messages and triggers spam analysis
@@ -24,20 +26,23 @@ import kotlinx.coroutines.launch
  *   1. Android delivers SMS_RECEIVED broadcast
  *   2. We extract sender + body from the PDU bundle
  *   3. Contact lookup: if the sender is in the user's contacts → ignore
- *   4. PII sanitization: strip personal data from the message body
- *   5. Hand off sanitized text to the analysis pipeline (next step to build)
+ *   4. Hand off to AnalyzeMessageUseCase (sanitize → API → result)
+ *   5. Log the result (notification UI comes in a later step)
  *
  * Important Android constraints:
  *   - onReceive() runs on the main thread with a ~10s deadline
  *   - goAsync() extends the deadline to ~30s for background work
- *   - For anything longer (API calls), we'll delegate to a WorkManager
- *     job or foreground service in a later step
+ *   - Typical API call completes in 2-5s, well within the deadline
+ *   - For production resilience, migrate to WorkManager (future step)
  */
-class SmsReceiver : BroadcastReceiver() {
+class SmsReceiver : BroadcastReceiver(), KoinComponent {
 
     companion object {
         private const val TAG = "ArtoSmsReceiver"
     }
+
+    // Injected by Koin — resolves from AppModule
+    private val analyzeMessageUseCase: AnalyzeMessageUseCase by inject()
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
@@ -56,8 +61,8 @@ class SmsReceiver : BroadcastReceiver() {
                 parts.joinToString("") { it.displayMessageBody ?: "" }
             }
 
-        // Use goAsync() so we can do the contact lookup off the main
-        // thread without hitting the 10-second ANR deadline.
+        // Use goAsync() so we can do the contact lookup + API call off
+        // the main thread without hitting the 10-second ANR deadline.
         val pendingResult = goAsync()
 
         CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
@@ -73,27 +78,32 @@ class SmsReceiver : BroadcastReceiver() {
                         continue
                     }
 
-                    // ── PII sanitization ────────────────────────
-                    val sanitized = PiiSanitizer.sanitize(body)
-                    Log.d(TAG, buildString {
-                        append("Sanitized message (${sanitized.redactionCount} redactions")
-                        if (sanitized.redactedTypes.isNotEmpty()) {
-                            append(": ${sanitized.redactedTypes.joinToString()}")
-                        }
-                        append("): ${sanitized.sanitizedText}")
+                    // ── Run the full analysis pipeline ──────────
+                    // AnalyzeMessageUseCase handles:
+                    //   1. PII sanitization (regex stripping)
+                    //   2. Anthropic API call (scam classification)
+                    //   3. Structured result with explanation
+                    val (messageInfo, analysisResult) = analyzeMessageUseCase.execute(
+                        sender = sender,
+                        rawBody = body
+                    )
+
+                    // ── Log the result ───────────────────────────
+                    Log.i(TAG, buildString {
+                        appendLine("═══ Arto Analysis Complete ═══")
+                        appendLine("  Sender:      $sender")
+                        appendLine("  Is Scam:     ${analysisResult.isScam}")
+                        appendLine("  Confidence:  ${(analysisResult.confidence * 100).toInt()}%")
+                        appendLine("  Explanation: ${analysisResult.explanation}")
+                        appendLine("  Sanitized:   ${messageInfo.sanitizedBody}")
+                        append("══════════════════════════════")
                     })
 
-                    // ── Hand off to analysis pipeline ───────────
-                    // TODO: This is where we'll call AnalyzeMessageUseCase
-                    // in the next step. For now, log the sanitized output
-                    // so you can verify the pipeline works end-to-end
-                    // by sending yourself a test SMS from another number.
-                    handleUnknownMessage(
-                        context = context,
-                        sender = sender,
-                        sanitizedBody = sanitized.sanitizedText,
-                        redactionCount = sanitized.redactionCount
-                    )
+                    // TODO (next step): Show notification to user
+                    // notificationHelper.showScamAlert(sender, analysisResult)
+
+                    // TODO (future): Save to Supabase for history
+                    // analysisRepository.save(messageInfo, analysisResult)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error processing SMS", e)
@@ -117,7 +127,6 @@ class SmsReceiver : BroadcastReceiver() {
      * silently ignoring a potential scam.
      */
     private fun isKnownContact(context: Context, phoneNumber: String): Boolean {
-        // Guard: don't crash if the user revoked the permission at runtime
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -138,38 +147,11 @@ class SmsReceiver : BroadcastReceiver() {
                 null,
                 null
             )?.use { cursor ->
-                cursor.moveToFirst()  // true if at least one contact matches
+                cursor.moveToFirst()
             } ?: false
         } catch (e: Exception) {
             Log.e(TAG, "Contact lookup failed for number", e)
-            false  // Fail open: analyze the message rather than skip it
+            false
         }
-    }
-
-    /**
-     * Placeholder for the analysis handoff. This will be replaced with
-     * a call to AnalyzeMessageUseCase → AnthropicApiClient in the next step.
-     *
-     * For now it logs the sanitized output so you can validate the
-     * receiver + sanitizer pipeline with `adb logcat -s ArtoSmsReceiver`.
-     */
-    private fun handleUnknownMessage(
-        context: Context,
-        sender: String,
-        sanitizedBody: String,
-        redactionCount: Int
-    ) {
-        Log.i(TAG, buildString {
-            appendLine("═══ Unknown sender detected ═══")
-            appendLine("  Sender:     $sender")
-            appendLine("  Redactions: $redactionCount")
-            appendLine("  Sanitized:  $sanitizedBody")
-            appendLine("  Next step:  Send to Anthropic API for analysis")
-            append("════════════════════════════════")
-        })
-
-        // TODO (next step): Wire up to AnalyzeMessageUseCase
-        // val result = analyzeMessageUseCase(sanitizedBody)
-        // notificationManager.showScamAlert(sender, result)
     }
 }
