@@ -1,5 +1,5 @@
 # Arto — AI-Powered Spam Shield for Android
-
+#
 Arto intercepts incoming SMS messages and phone calls from unknown senders, analyzes them with AI, and tells you whether they're scams — all while keeping your personal data private.
 
 ## How It Works
